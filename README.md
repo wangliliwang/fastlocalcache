@@ -6,3 +6,6 @@
 
 命名：
 fastlocalcache
+
+benchmark参考：
+https://github.com/dgraph-io/benchmarks/tree/master/cachebench/ristretto
