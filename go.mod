@@ -1,4 +1,4 @@
-module fastcache_lru
+module fastlocalcache
 
 go 1.19
 
