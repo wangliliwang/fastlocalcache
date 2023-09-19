@@ -2,177 +2,180 @@ package fastlocalcache
 
 import (
 	"errors"
-	"fmt"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
+	"math"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	shardsCount int64 = 256
-	neverExpire int64 = -1
+	shardsCount int64         = 256
+	neverExpire time.Duration = -1
 )
 
+type DeleteReason int64
+
+const (
+	DeleteReasonByUser DeleteReason = iota
+)
+
+type Cacher interface {
+	Get(key string, value any) error
+	Set(key string, value any, expiration *time.Duration) error
+	Contains(key string) bool
+	Len() int64
+	Delete(key string)
+	//Iterator()
+}
+
+type OnDelete func()
+
+type Config struct {
+	Hasher     Hasher
+	Serializer Serializer
+
+	CleanUpInterval time.Duration
+	OnDelete        OnDelete // 删除callback
+
+	Verbose bool // 是否打印详情
+}
+
 type Cache struct {
-	serializer Serializer
-	shardedMap *shardedMap
+	len int64
+
+	serializer  Serializer
+	cacheShards [shardsCount]*cacheShard
+	hasher      Hasher
+	clocker     Clocker
+
+	expiration     time.Duration
+	expirationRing []byte // 方便失效的圆环
 }
 
-func NewCache() *Cache {
-	c := &Cache{
-		serializer: JSONSerializer{},
-		shardedMap: newShardedMap(),
-	}
-	go c.scanAndExpire()
-	return c
+func (c *Cache) getShardInfo(key string) (uint64, int) {
+	hash := c.hasher.Sum64(key)
+	return hash, int(hash % uint64(shardsCount))
 }
 
-func hasExpired(now, expireAt int64) bool {
-	return expireAt != neverExpire && now > expireAt
+func (c *Cache) hasExpired(expireTimestampInseconds uint64) bool {
+	return expireTimestampInseconds < uint64(c.clocker.CurrentTime().Unix())
 }
 
-func (c *Cache) scanAndExpire() {
-	quitChannel := make(chan os.Signal)
-	signal.Notify(quitChannel, syscall.SIGINT, syscall.SIGTERM)
-	for {
-		select {
-		case <-time.After(time.Minute):
-			c.shardedMap.scanAndExpire()
-		case <-quitChannel:
-			break
-		}
-	}
+func (c *Cache) incrLen() {
+	atomic.AddInt64(&c.len, 1)
+}
+
+func (c *Cache) descLen() {
+	atomic.AddInt64(&c.len, -1)
 }
 
 func (c *Cache) Get(key string, value any) error {
-	// get from store
-	ci, ok := c.shardedMap.Get(key)
-	if !ok {
-		return errors.New("missing key")
+	// hash
+	keyHash, shardIndex := c.getShardInfo(key)
+
+	ety, getErr := c.cacheShards[shardIndex].Get(key, keyHash)
+	if getErr != nil {
+		return getErr
 	}
 
-	// delete expired key
-	if hasExpired(time.Now().Unix(), ci.expireAt) {
-		c.shardedMap.Del(key)
-		return errors.New("missing key")
+	// unpack
+	if c.hasExpired(ety.getTimestamp()) {
+		return errors.New("expired")
 	}
 
-	// unmarshal
-	err := c.serializer.Unmarshal(ci.value, value)
-	if err != nil {
-		return fmt.Errorf("unmarshal error: %w", err)
+	// dese
+	unmarshalErr := c.serializer.Unmarshal(ety.getValue(), value)
+	if unmarshalErr != nil {
+		return unmarshalErr
 	}
 
 	return nil
 }
 
 func (c *Cache) Set(key string, value any, expiration *time.Duration) error {
-	// marshal
-	bs, err := c.serializer.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("marshal error: %w", err)
+	// key 长度检查
+	if len(key) > 1<<17 {
+		return errors.New("key too long")
 	}
 
-	// set to store
-	ci := &cacheItem{
-		value: bs,
+	// hash
+	keyHash, shardIndex := c.getShardInfo(key)
+
+	// serialize
+	valueBytes, marsharErr := c.serializer.Marshal(value)
+	if marsharErr != nil {
+		return marsharErr
 	}
-	if expiration == nil {
-		ci.expireAt = neverExpire
+	if len(valueBytes) > 1<<33 {
+		return errors.New("value too long")
+	}
+
+	// 计算过期时间.
+	// 不传过期时间，按照默认过期时间来
+	// 传-1的过期时间，表示用不失效
+	var expireTimestampInSeconds uint64
+	if expiration == nil { // == nil, 表示无过期时间
+		expiration = &c.expiration
+	}
+	if *expiration == neverExpire {
+		expireTimestampInSeconds = math.MaxUint64
 	} else {
-		ci.expireAt = time.Now().Add(*expiration).Unix()
+		expireTimestampInSeconds = uint64(c.clocker.CurrentTime().Add(*expiration).Unix())
 	}
-	c.shardedMap.Set(key, ci)
 
+	ety := packEntry(expireTimestampInSeconds, keyHash, key, valueBytes)
+
+	ss, setErr := c.cacheShards[shardIndex].Set(key, keyHash, ety)
+	if setErr != nil {
+		return setErr
+	}
+
+	// counter
+	if ss == setStateSet {
+		c.incrLen()
+	}
 	return nil
 }
 
+func (c *Cache) Contains(key string) bool {
+	// hash
+	keyHash, shardIndex := c.getShardInfo(key)
+
+	ety, getErr := c.cacheShards[shardIndex].Get(key, keyHash)
+	if getErr != nil {
+		return false
+	}
+
+	// unpack
+	if c.hasExpired(ety.getTimestamp()) {
+		return false
+	}
+
+	return true
+}
+
 func (c *Cache) Len() int64 {
-	return c.shardedMap.len
+	return atomic.LoadInt64(&c.len)
 }
 
-func (c *Cache) Del(key string) {
-	c.shardedMap.Del(key)
-}
+func (c *Cache) Delete(key string) {
+	// hash
+	keyHash, shardIndex := c.getShardInfo(key)
 
-type cacheItem struct {
-	value    []byte
-	expireAt int64 // unix timestamp, in seconds
-}
-
-func newShardedMap() *shardedMap {
-	shards := make([]*sync.Map, shardsCount)
-	for i := 0; i < int(shardsCount); i++ {
-		shards[i] = &sync.Map{}
-	}
-	return &shardedMap{
-		shards:      shards,
-		shardsCount: shardsCount,
-		keyToHash:   KeyToHash,
+	ds := c.cacheShards[shardIndex].Delete(key, keyHash)
+	if ds == deleteStateDoDelete {
+		c.descLen()
 	}
 }
 
-type shardedMap struct {
-	shards      []*sync.Map
-	shardsCount int64
-	len         int64 // 实际存储的key的数量，包括失效的
-	keyToHash   func(key string) uint64
-}
-
-func (m *shardedMap) getShard(key string) *sync.Map {
-	hash := m.keyToHash(key)
-	return m.shards[hash%uint64(m.shardsCount)]
-}
-
-func (m *shardedMap) Get(key string) (*cacheItem, bool) {
-	value, ok := m.getShard(key).Load(key)
-	if !ok {
-		return nil, false
+func NewCache() *Cache {
+	c := &Cache{
+		serializer: JSONSerializer{},
+		hasher:     newDefaultHasher(),
 	}
-	ci, ok := value.(*cacheItem)
-	if !ok {
-		panic("unsupported value")
-	}
-	return ci, true
-}
 
-func (m *shardedMap) Set(key string, value *cacheItem) {
-	_, loaded := m.getShard(key).Swap(key, value)
-	if !loaded {
-		m.len++
-	}
-}
+	// init shards
 
-func (m *shardedMap) Del(key string) {
-	m.del(key)
-}
+	// init clean up
 
-func (m *shardedMap) del(key string) {
-	_, loaded := m.getShard(key).LoadAndDelete(key)
-	if loaded {
-		m.len--
-	}
-}
-
-func (m *shardedMap) scanAndExpire() {
-	now := time.Now().Unix()
-	for _, shard := range m.shards {
-		shard.Range(func(key, value any) bool {
-			ci, ok := value.(*cacheItem)
-			if !ok {
-				panic("unsupported value")
-			}
-			if hasExpired(now, ci.expireAt) {
-				keyStr, ok := key.(string)
-				if !ok {
-					panic("unsupported key type")
-				}
-				m.del(keyStr)
-			}
-
-			return true
-		})
-	}
+	return c
 }
