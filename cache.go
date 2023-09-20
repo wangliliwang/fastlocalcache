@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	shardsCount int64         = 256
+	shardCount  int64         = 1 << 8
 	neverExpire time.Duration = -1
 )
 
@@ -23,7 +23,7 @@ type Cacher interface {
 	Set(key string, value any, expiration *time.Duration) error
 	Contains(key string) bool
 	Len() int64
-	Delete(key string)
+	Delete(key string) error
 	//Iterator()
 }
 
@@ -43,17 +43,17 @@ type Cache struct {
 	len int64
 
 	serializer  Serializer
-	cacheShards [shardsCount]*cacheShard
+	cacheShards [shardCount]*cacheShard
 	hasher      Hasher
 	clocker     Clocker
 
 	expiration     time.Duration
-	expirationRing []byte // 方便失效的圆环
+	expirationRing []byte // 方便失效的圆环. 留着下期做. 现在就算失效了，也释放不出内存空间.
 }
 
 func (c *Cache) getShardInfo(key string) (uint64, int) {
 	hash := c.hasher.Sum64(key)
-	return hash, int(hash % uint64(shardsCount))
+	return hash, int(hash % uint64(shardCount))
 }
 
 func (c *Cache) hasExpired(expireTimestampInseconds uint64) bool {
@@ -122,9 +122,12 @@ func (c *Cache) Set(key string, value any, expiration *time.Duration) error {
 		expireTimestampInSeconds = uint64(c.clocker.CurrentTime().Add(*expiration).Unix())
 	}
 
-	ety := packEntry(expireTimestampInSeconds, keyHash, key, valueBytes)
+	ety, packErr := packEntry(entryStateNormal, expireTimestampInSeconds, keyHash, key, valueBytes)
+	if packErr != nil {
+		return packErr
+	}
 
-	ss, setErr := c.cacheShards[shardIndex].Set(key, keyHash, ety)
+	ss, deleteOnSet, setErr := c.cacheShards[shardIndex].Set(key, keyHash, ety)
 	if setErr != nil {
 		return setErr
 	}
@@ -132,6 +135,9 @@ func (c *Cache) Set(key string, value any, expiration *time.Duration) error {
 	// counter
 	if ss == setStateSet {
 		c.incrLen()
+	}
+	if deleteOnSet {
+		c.descLen()
 	}
 	return nil
 }
@@ -157,14 +163,21 @@ func (c *Cache) Len() int64 {
 	return atomic.LoadInt64(&c.len)
 }
 
-func (c *Cache) Delete(key string) {
+func (c *Cache) Delete(key string) error {
 	// hash
 	keyHash, shardIndex := c.getShardInfo(key)
 
-	ds := c.cacheShards[shardIndex].Delete(key, keyHash)
+	// delete
+	ds, deleteErr := c.cacheShards[shardIndex].Delete(key, keyHash)
+	if deleteErr != nil {
+		return deleteErr
+	}
+
+	// len
 	if ds == deleteStateDoDelete {
 		c.descLen()
 	}
+	return nil
 }
 
 func NewCache() *Cache {
